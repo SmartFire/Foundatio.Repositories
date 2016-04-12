@@ -80,8 +80,15 @@
       <Link>Utility\TaskHelper.cs</Link>
     </Compile>
     <Compile Include="Extensions\DateTimeExtensions.cs" />
+    <Compile Include="Extensions\TimeSpanExtensions.cs" />
     <Compile Include="Jobs\ReindexWorkItem.cs" />
     <Compile Include="Jobs\ReindexWorkItemHandler.cs" />
+    <Compile Include="Repositories\Filter\FieldAggregationProcessorBase.cs" />
+    <Compile Include="Repositories\Models\NumbersStatsResult.cs" />
+    <Compile Include="Repositories\Models\NumbersTermStatsItem.cs" />
+    <Compile Include="Repositories\Models\NumbersTermStatsResult.cs" />
+    <Compile Include="Repositories\Models\NumbersTimelineItem.cs" />
+    <Compile Include="Repositories\Models\NumbersTimelineStatsResult.cs" />
     <Compile Include="Repositories\Configuration\ElasticConfigurationBase.cs" />
     <Compile Include="Repositories\Configuration\IElasticIndex.cs" />
     <Compile Include="Extensions\ElasticExtensions.cs" />
