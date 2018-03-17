@@ -7,22 +7,26 @@ using System.Threading;
 using System.Threading.Tasks;
 using Exceptionless.DateTimeExtensions;
 using Foundatio.Jobs;
-using Foundatio.Logging;
-using Foundatio.Repositories.Elasticsearch.Extensions;
+using Foundatio.Lock;
+using Microsoft.Extensions.Logging;
+using Foundatio.Parsers.ElasticQueries.Extensions;
 using Foundatio.Repositories.Extensions;
 using Foundatio.Utility;
+using Microsoft.Extensions.Logging.Abstractions;
 using Nest;
 
 namespace Foundatio.Repositories.Elasticsearch.Jobs {
     public class CleanupIndexesJob : IJob {
         private readonly IElasticClient _client;
         private readonly ILogger _logger;
+        private readonly ILockProvider _lockProvider;
         private static readonly CultureInfo _enUS = new CultureInfo("en-US");
         private readonly ICollection<IndexMaxAge> _indexes = new List<IndexMaxAge>();
 
-        public CleanupIndexesJob(IElasticClient client, ILoggerFactory loggerFactory) {
+        public CleanupIndexesJob(IElasticClient client, ILockProvider lockProvider, ILoggerFactory loggerFactory) {
             _client = client;
-            _logger = loggerFactory.CreateLogger(GetType());
+            _lockProvider = lockProvider;
+            _logger = loggerFactory?.CreateLogger(GetType()) ?? NullLogger.Instance;
         }
 
         protected void AddIndex(TimeSpan maxAge, Func<string, DateTime?> getAge) {
@@ -31,58 +35,93 @@ namespace Foundatio.Repositories.Elasticsearch.Jobs {
 
         protected void AddIndex(string prefix, TimeSpan maxAge) {
             _indexes.Add(new IndexMaxAge(maxAge, idx => {
-                DateTime result;
-                if (DateTime.TryParseExact(idx, "'" + prefix + "-'yyyy.MM.dd", _enUS, DateTimeStyles.None, out result))
+                if (DateTime.TryParseExact(idx, "'" + prefix + "-'yyyy.MM.dd", _enUS, DateTimeStyles.None, out var result))
                     return result;
 
                 return null;
             }));
         }
 
-        public async Task<JobResult> RunAsync(CancellationToken cancellationToken = default(CancellationToken)) {
-            _logger.Info("Starting index cleanup...");
+        public virtual async Task<JobResult> RunAsync(CancellationToken cancellationToken = default) {
+            _logger.LogInformation("Starting index cleanup...");
 
-            await DeleteOldIndexesAsync().AnyContext();
-
-            _logger.Info("Finished index cleanup.");
-
-            return JobResult.Success;
-        }
-
-        private async Task DeleteOldIndexesAsync() {
             var sw = Stopwatch.StartNew();
             var result = await _client.CatIndicesAsync(
-                d => d.RequestConfiguration(r =>
-                    r.RequestTimeout(5 * 60 * 1000))).AnyContext();
+                d => d.RequestConfiguration(r => r.RequestTimeout(TimeSpan.FromMinutes(5))), cancellationToken).AnyContext();
 
             sw.Stop();
-            var indexes = new List<IndexDate>();
-            if (result.IsValid && result.Records != null)
-                indexes = result.Records?.Select(r => GetIndexDate(r.Index)).ToList();
 
             if (result.IsValid)
-                _logger.Info($"Retrieved list of {indexes.Count} indexes in {sw.Elapsed.ToWords(true)}");
+                _logger.LogInformation("Retrieved list of {IndexCount} indexes in {Duration:g}", result.Records?.Count(), sw.Elapsed.ToWords(true));
             else
-                _logger.Error($"Failed to retrieve list of indexes: {result.GetErrorMessage()}");
+                _logger.LogError("Failed to retrieve list of indexes: {0}", result.GetErrorMessage());
 
-            if (indexes.Count == 0)
-                return;
+            var indexes = new List<IndexDate>();
+            if (result.IsValid && result.Records != null)
+                indexes = result.Records?.Select(r => GetIndexDate(r.Index)).Where(r => r != null).ToList();
 
-            DateTime now = SystemClock.UtcNow;
+            if (indexes == null || indexes.Count == 0)
+                return JobResult.Success;
+
+            var now = SystemClock.UtcNow;
             var indexesToDelete = indexes.Where(r => r.Date < now.Subtract(r.MaxAge)).ToList();
 
-            if (indexesToDelete.Count == 0)
-                return;
+            if (indexesToDelete.Count == 0) {
+                _logger.LogInformation("No indexes selected for deletion.");
+                return JobResult.Success;
+            }
 
             // log that we are seeing indexes that should have been deleted already
             var oldIndexes = indexes.Where(s => s.Date < now.Subtract(s.MaxAge).AddDays(-1)).ToList();
             if (oldIndexes.Count > 0)
-                _logger.Error($"Found old indexes that should've been deleted: {String.Join(", ", oldIndexes)}");
+                _logger.LogError($"Found old indexes that should've been deleted: {String.Join(", ", oldIndexes)}");
 
-            _logger.Info($"Selected {indexesToDelete.Count} indexes for deletion");
+            _logger.LogInformation("Selected {IndexCount} indexes for deletion", indexesToDelete.Count);
 
-            foreach (var oldIndex in indexesToDelete)
-                await _client.DeleteIndexAsync(oldIndex.Index, d => d).AnyContext();
+            bool shouldContinue = true;
+            foreach (var oldIndex in indexesToDelete) {
+                if (!shouldContinue) {
+                    _logger.LogInformation("Stopped deleted snapshots.");
+                    break;
+                }
+
+                _logger.LogInformation("Acquiring lock to delete index {OldIndex}", oldIndex.Index);
+                try {
+                    await _lockProvider.TryUsingAsync("es-delete-index", async t => {
+                        _logger.LogInformation("Got lock to delete index {OldIndex}", oldIndex.Index);
+                        sw.Restart();
+                        var response = await _client.DeleteIndexAsync(oldIndex.Index, d => d, t).AnyContext();
+                        sw.Stop();
+
+                        if (response.IsValid)
+                            await OnIndexDeleted(oldIndex.Index, sw.Elapsed).AnyContext();
+                        else
+                            shouldContinue = await OnIndexDeleteFailure(oldIndex.Index, sw.Elapsed, response, null).AnyContext();
+                    }, TimeSpan.FromMinutes(30), cancellationToken).AnyContext();
+                } catch (Exception ex) {
+                    sw.Stop();
+                    shouldContinue = await OnIndexDeleteFailure(oldIndex.Index, sw.Elapsed, null, ex).AnyContext();
+                }
+            }
+
+            await OnCompleted(indexesToDelete.Select(i => i.Index).ToList(), sw.Elapsed).AnyContext();
+
+            return JobResult.Success;
+        }
+
+        public virtual Task OnIndexDeleted(string indexName, TimeSpan duration) {
+            _logger.LogInformation("Completed delete index {IndexName} in {Duration:g}", indexName, duration.ToWords(true));
+            return Task.CompletedTask;
+        }
+
+        public virtual Task<bool> OnIndexDeleteFailure(string indexName, TimeSpan duration, IDeleteIndexResponse response, Exception ex) {
+            _logger.LogError("Failed to delete index {IndexName} after {Duration:g}: {ErrorMessage}", indexName, duration, (response != null ? response.GetErrorMessage() : ex?.Message));
+            return Task.FromResult(true);
+        }
+
+        public virtual Task OnCompleted(IReadOnlyCollection<string> deletedIndexes, TimeSpan duration) {
+            _logger.LogInformation("Finished cleaning up {IndexCount} in {Duration}.", deletedIndexes.Count, duration);
+            return Task.CompletedTask;
         }
 
         private IndexDate GetIndexDate(string name) {

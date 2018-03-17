@@ -1,22 +1,13 @@
-﻿using System;
-using System.Threading.Tasks;
-using Nest;
+﻿using System.Threading.Tasks;
+using Foundatio.Repositories.Extensions;
 
 namespace Foundatio.Repositories.Elasticsearch.Configuration {
     public class Index : IndexBase {
         public Index(IElasticConfiguration configuration, string name) : base(configuration, name) {}
 
-        public override Task ConfigureAsync() {
-            return CreateIndexAsync(Name, ConfigureDescriptor);
-        }
-        
-        public virtual CreateIndexDescriptor ConfigureDescriptor(CreateIndexDescriptor idx) {
-            idx.AddAlias(Name);
-
-            foreach (var t in IndexTypes)
-                t.Configure(idx);
-
-            return idx;
+        public override async Task ConfigureAsync() {
+            await base.ConfigureAsync().AnyContext();
+            await CreateIndexAsync(Name, ConfigureIndex).AnyContext();
         }
     }
 

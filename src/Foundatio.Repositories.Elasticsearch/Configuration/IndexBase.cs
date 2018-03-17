@@ -2,13 +2,13 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
-using Elasticsearch.Net;
 using Foundatio.Lock;
-using Foundatio.Logging;
-using Foundatio.Repositories.Elasticsearch.Extensions;
+using Foundatio.Parsers.ElasticQueries.Extensions;
 using Foundatio.Repositories.Elasticsearch.Jobs;
 using Foundatio.Repositories.Extensions;
-using Foundatio.Utility;
+using Foundatio.Repositories.Models;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Nest;
 
 namespace Foundatio.Repositories.Elasticsearch.Configuration {
@@ -22,7 +22,7 @@ namespace Foundatio.Repositories.Elasticsearch.Configuration {
             Name = name;
             Configuration = configuration;
             _lockProvider = new CacheLockProvider(configuration.Cache, configuration.MessageBus, configuration.LoggerFactory);
-            _logger = configuration.LoggerFactory.CreateLogger(GetType());
+            _logger = configuration.LoggerFactory?.CreateLogger(GetType()) ?? NullLogger.Instance;
             _frozenTypes = new Lazy<IReadOnlyCollection<IIndexType>>(() => _types.AsReadOnly());
         }
 
@@ -44,54 +44,30 @@ namespace Foundatio.Repositories.Elasticsearch.Configuration {
             return indexType;
         }
 
-        public abstract Task ConfigureAsync();
+        public virtual async Task ConfigureAsync() {
+            foreach (var t in IndexTypes)
+                await t.ConfigureAsync().AnyContext();
+        }
 
         public virtual Task DeleteAsync() {
             return DeleteIndexAsync(Name);
         }
-        
+
         protected virtual async Task CreateIndexAsync(string name, Func<CreateIndexDescriptor, CreateIndexDescriptor> descriptor) {
             if (name == null)
                 throw new ArgumentNullException(nameof(name));
 
-            bool result = await _lockProvider.TryUsingAsync("create-index:" + name, async t => {
-                if (await IndexExistsAsync(name).AnyContext()) {
-                    var healthResponse = await Configuration.Client.ClusterHealthAsync(h => h
-                        .Index(name)
-                        .WaitForStatus(WaitForStatus.Yellow)
-                        .Timeout("10s")).AnyContext();
+            var response = await Configuration.Client.CreateIndexAsync(name, descriptor).AnyContext();
+            if (_logger.IsEnabled(Microsoft.Extensions.Logging.LogLevel.Trace))
+                _logger.LogInformation(response.GetRequest());
 
-                    if (!healthResponse.IsValid || (healthResponse.Status != "green" && healthResponse.Status != "yellow") || healthResponse.TimedOut)
-                        throw new ApplicationException($"Index {name} exists but is unhealthy: {healthResponse.Status}.", healthResponse.ConnectionStatus.OriginalException);
+            // check for valid response or that the index already exists
+            if (response.IsValid || response.ServerError.Status == 400 && response.ServerError.Error.Type == "index_already_exists_exception")
+                return;
 
-                    return;
-                }
-
-                var response = await Configuration.Client.CreateIndexAsync(name, descriptor).AnyContext();
-                _logger.Trace(() => response.GetRequest());
-
-                if (response.IsValid) {
-                    while (!await IndexExistsAsync(name).AnyContext())
-                        SystemClock.Sleep(100);
-
-                    var healthResponse = await Configuration.Client.ClusterHealthAsync(h => h
-                        .Index(name)
-                        .WaitForStatus(WaitForStatus.Yellow)
-                        .Timeout("10s")).AnyContext();
-
-                    if (!healthResponse.IsValid || (healthResponse.Status != "green" && healthResponse.Status != "yellow") || healthResponse.TimedOut)
-                        throw new ApplicationException($"Index {name} is unhealthy: {healthResponse.Status}.", healthResponse.ConnectionStatus.OriginalException);
-
-                    return;
-                }
-
-                string message = $"Error creating the index {name}: {response.GetErrorMessage()}";
-                _logger.Error().Exception(response.ConnectionStatus.OriginalException).Message(message).Property("request", response.GetRequest()).Write();
-                throw new ApplicationException(message, response.ConnectionStatus.OriginalException);
-            }, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(1));
-
-            if (!result)
-                throw new ApplicationException($"Unable to acquire index creation lock for \"{name}\".");
+            string message = $"Error creating the index {name}: {response.GetErrorMessage()}";
+            _logger.LogError(response.OriginalException, message);
+            throw new ApplicationException(message, response.OriginalException);
         }
 
         protected virtual async Task DeleteIndexAsync(string name) {
@@ -101,21 +77,18 @@ namespace Foundatio.Repositories.Elasticsearch.Configuration {
             if (!await IndexExistsAsync(name).AnyContext())
                 return;
 
-            var response = await Configuration.Client.DeleteIndexAsync(i => i.Index(name)).AnyContext();
-            _logger.Trace(() => response.GetRequest());
+            var response = await Configuration.Client.DeleteIndexAsync(name).AnyContext();
+            if (_logger.IsEnabled(Microsoft.Extensions.Logging.LogLevel.Trace))
+                _logger.LogTrace(response.GetRequest());
 
-            if (response.IsValid) {
-                while (await IndexExistsAsync(name).AnyContext())
-                    SystemClock.Sleep(100);
-                
+            if (response.IsValid)
                 return;
-            }
-            
+
             string message = $"Error deleting index {name}: {response.GetErrorMessage()}";
-            _logger.Error().Exception(response.ConnectionStatus.OriginalException).Message(message).Property("request", response.GetRequest()).Write();
-            throw new ApplicationException(message, response.ConnectionStatus.OriginalException);
+            _logger.LogError(response.OriginalException, message);
+            throw new ApplicationException(message, response.OriginalException);
         }
-        
+
         protected async Task<bool> IndexExistsAsync(string name) {
             if (name == null)
                 throw new ArgumentNullException(nameof(name));
@@ -125,22 +98,50 @@ namespace Foundatio.Repositories.Elasticsearch.Configuration {
                 return response.Exists;
 
             string message = $"Error checking to see if index {name} exists: {response.GetErrorMessage()}";
-            _logger.Error().Exception(response.ConnectionStatus.OriginalException).Message(message).Property("request", response.GetRequest()).Write();
-            throw new ApplicationException(message, response.ConnectionStatus.OriginalException);
+            _logger.LogError(response.OriginalException, message);
+            throw new ApplicationException(message, response.OriginalException);
         }
 
         public virtual Task ReindexAsync(Func<int, string, Task> progressCallbackAsync = null) {
             var reindexWorkItem = new ReindexWorkItem {
                 OldIndex = Name,
                 NewIndex = Name,
-                DeleteOld = false
+                DeleteOld = false,
+                TimestampField = GetTimeStampField()
             };
 
-            foreach (var type in IndexTypes.OfType<IChildIndexType>())
-                reindexWorkItem.ParentMaps.Add(new ParentMap { Type = type.Name, ParentPath = type.ParentPath });
-
-            var reindexer = new ElasticReindexer(Configuration.Client, Configuration.Cache, _logger);
+            var reindexer = new ElasticReindexer(Configuration.Client, _logger);
             return reindexer.ReindexAsync(reindexWorkItem, progressCallbackAsync);
+        }
+
+        /// <summary>
+        /// Attempt to get the document modified date for reindexing.
+        /// NOTE: We make the assumption that all types implement the same date interfaces.
+        /// </summary>
+        protected virtual string GetTimeStampField() {
+            if (IndexTypes.Count == 0)
+                return null;
+
+            var type = IndexTypes.First().Type;
+            if (IndexTypes.All(i => typeof(IHaveDates).IsAssignableFrom(i.Type)))
+                return Configuration.Client.Infer.PropertyName(type.GetProperty(nameof(IHaveDates.UpdatedUtc)));
+
+            if (IndexTypes.All(i => typeof(IHaveCreatedDate).IsAssignableFrom(i.Type)))
+                return Configuration.Client.Infer.PropertyName(type.GetProperty(nameof(IHaveCreatedDate.CreatedUtc)));
+
+            return null;
+        }
+
+        public virtual CreateIndexDescriptor ConfigureIndex(CreateIndexDescriptor idx) {
+            var aliases = new AliasesDescriptor();
+            var mappings = new MappingsDescriptor();
+
+            foreach (var t in IndexTypes) {
+                aliases = t.ConfigureIndexAliases(aliases);
+                mappings = t.ConfigureIndexMappings(mappings);
+            }
+
+            return idx.Aliases(a => aliases).Mappings(m => mappings);
         }
 
         public virtual void ConfigureSettings(ConnectionSettings settings) {

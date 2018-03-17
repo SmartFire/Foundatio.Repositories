@@ -1,14 +1,25 @@
-﻿using System;
+﻿using Foundatio.Repositories.Options;
 
-namespace Foundatio.Repositories.Queries {
-    public interface ISoftDeletesQuery : IRepositoryQuery {
-        bool IncludeSoftDeletes { get; set; }
+namespace Foundatio.Repositories {
+    public static class SoftDeleteQueryExtensions {
+        internal const string SoftDeleteModeKey = "@SoftDeleteMode";
+
+        public static T SoftDeleteMode<T>(this T query, SoftDeleteQueryMode mode) where T : IRepositoryQuery {
+            return query.BuildOption(SoftDeleteModeKey, mode);
+        }
     }
 
-    public static class SoftDeletesQueryExtensions {
-        public static T IncludeDeleted<T>(this T query, bool includeDeleted = true) where T : ISoftDeletesQuery {
-            query.IncludeSoftDeletes = includeDeleted;
-            return query;
+    public enum SoftDeleteQueryMode {
+        ActiveOnly,
+        DeletedOnly,
+        All
+    }
+}
+
+namespace Foundatio.Repositories.Queries {
+    public static class ReadCacheOptionsExtensions {
+        public static SoftDeleteQueryMode GetSoftDeleteMode(this IRepositoryQuery query, SoftDeleteQueryMode defaultMode = SoftDeleteQueryMode.ActiveOnly) {
+            return query.SafeGetOption<SoftDeleteQueryMode>(SoftDeleteQueryExtensions.SoftDeleteModeKey, defaultMode);
         }
     }
 }

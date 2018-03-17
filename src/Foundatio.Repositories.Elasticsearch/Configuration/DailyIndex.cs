@@ -4,14 +4,14 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Linq;
 using System.Threading.Tasks;
-using Foundatio.Logging;
-using Foundatio.Repositories.Elasticsearch.Extensions;
 using Nest;
 using Exceptionless.DateTimeExtensions;
 using Foundatio.Caching;
+using Foundatio.Parsers.ElasticQueries.Extensions;
 using Foundatio.Repositories.Elasticsearch.Jobs;
 using Foundatio.Repositories.Extensions;
 using Foundatio.Utility;
+using Microsoft.Extensions.Logging;
 
 namespace Foundatio.Repositories.Elasticsearch.Configuration {
     public class DailyIndexType<T> : TimeSeriesIndexType<T> where T : class {
@@ -23,22 +23,32 @@ namespace Foundatio.Repositories.Elasticsearch.Configuration {
         private readonly List<IndexAliasAge> _aliases = new List<IndexAliasAge>();
         private readonly Lazy<IReadOnlyCollection<IndexAliasAge>> _frozenAliases;
         private readonly ICacheClient _aliasCache;
+        private TimeSpan? _maxIndexAge;
 
-        public DailyIndex(IElasticConfiguration configuration, string name, int version = 1) 
+        public DailyIndex(IElasticConfiguration configuration, string name, int version = 1)
             : base(configuration, name, version) {
             AddAlias(Name);
             _frozenAliases = new Lazy<IReadOnlyCollection<IndexAliasAge>>(() => _aliases.AsReadOnly());
             _aliasCache = new ScopedCacheClient(configuration.Cache, "alias");
         }
 
-        // TODO: Should we make this non nullable and do validation in the setter.
-        // This should never be be negative or less than the index time period (day or a month)
-        public TimeSpan? MaxIndexAge { get; set; }
+        /// <summary>
+        /// This should never be be negative or less than the index time period (day or a month)
+        /// </summary>
+        public TimeSpan? MaxIndexAge {
+            get { return _maxIndexAge; }
+            set {
+                if (value.HasValue && value.Value <= TimeSpan.Zero)
+                    throw new ArgumentException($"{nameof(MaxIndexAge)} cannot be negative. ");
+
+                _maxIndexAge = value;
+            }
+        }
 
         public bool DiscardExpiredIndexes { get; set; } = true;
 
         protected virtual DateTime GetIndexExpirationDate(DateTime utcDate) {
-            return MaxIndexAge.HasValue && MaxIndexAge > TimeSpan.Zero ? utcDate.EndOfDay().Add(MaxIndexAge.Value) : DateTime.MaxValue;
+            return MaxIndexAge.HasValue && MaxIndexAge > TimeSpan.Zero ? utcDate.EndOfDay().SafeAdd(MaxIndexAge.Value) : DateTime.MaxValue;
         }
 
         public IReadOnlyCollection<IndexAliasAge> Aliases => _frozenAliases.Value;
@@ -57,8 +67,9 @@ namespace Foundatio.Repositories.Elasticsearch.Configuration {
             });
         }
 
-        public override Task ConfigureAsync() {
-            return Task.CompletedTask;
+        public override async Task ConfigureAsync() {
+            foreach (var t in IndexTypes)
+                await t.ConfigureAsync().AnyContext();
         }
 
         protected override async Task CreateAliasAsync(string index, string name) {
@@ -83,49 +94,44 @@ namespace Foundatio.Repositories.Elasticsearch.Configuration {
 
             return $"{Name}-v{version}-{utcDate.ToString(DateFormat)}";
         }
-        
+
         protected override DateTime GetIndexDate(string index) {
-            var version = GetIndexVersion(index);
+            int version = GetIndexVersion(index);
             if (version < 0)
                 version = Version;
 
-            DateTime result;
-            if (DateTime.TryParseExact(index, $"\'{Name}-v{version}-\'{DateFormat}", EnUs, DateTimeStyles.AdjustToUniversal, out result))
-                return result.Date;
+            if (DateTime.TryParseExact(index, $"\'{Name}-v{version}-\'{DateFormat}", EnUs, DateTimeStyles.AdjustToUniversal, out var result))
+                return DateTime.SpecifyKind(result.Date, DateTimeKind.Utc);
 
             return DateTime.MaxValue;
         }
 
         public virtual async Task EnsureIndexAsync(DateTime utcDate) {
             var indexExpirationUtcDate = GetIndexExpirationDate(utcDate);
-            if (SystemClock.UtcNow >= indexExpirationUtcDate)
+            if (SystemClock.UtcNow > indexExpirationUtcDate)
                 throw new ArgumentException($"Index max age exceeded: {indexExpirationUtcDate}", nameof(utcDate));
 
             var expires = indexExpirationUtcDate < DateTime.MaxValue ? indexExpirationUtcDate : (DateTime?)null;
-            string alias = GetIndex(utcDate);
-            if (await _aliasCache.ExistsAsync(alias).AnyContext()) {
+            string unversionedIndexAlias = GetIndex(utcDate);
+            if (await _aliasCache.ExistsAsync(unversionedIndexAlias).AnyContext())
+                return;
+
+            if (await AliasExistsAsync(unversionedIndexAlias).AnyContext()) {
+                await _aliasCache.SetAsync(unversionedIndexAlias, unversionedIndexAlias, expires).AnyContext();
                 return;
             }
 
-            if (await AliasExistsAsync(alias).AnyContext()) {
-                await _aliasCache.AddAsync(alias, alias, expires).AnyContext();
-                return;
-            }
-
-            // Try creating the index.
-            var index = GetVersionedIndex(utcDate);
+            // try creating the index.
+            string index = GetVersionedIndex(utcDate);
             await CreateIndexAsync(index, descriptor => {
-                var d = ConfigureDescriptor(descriptor).AddAlias(alias);
+                var aliasesDescriptor = new AliasesDescriptor().Alias(unversionedIndexAlias);
                 foreach (var a in Aliases.Where(a => ShouldCreateAlias(utcDate, a)))
-                    d.AddAlias(a.Name);
+                    aliasesDescriptor.Alias(a.Name);
 
-                return d;
+                return ConfigureIndex(descriptor).Aliases(a => aliasesDescriptor);
             }).AnyContext();
 
-            if (!await AliasExistsAsync(alias).AnyContext())
-                throw new ApplicationException($"Unable to create alias {alias} for index {index}.");
-
-            await _aliasCache.AddAsync(alias, alias, expires).AnyContext();
+            await _aliasCache.SetAsync(unversionedIndexAlias, unversionedIndexAlias, expires).AnyContext();
         }
 
         protected virtual bool ShouldCreateAlias(DateTime documentDateUtc, IndexAliasAge alias) {
@@ -154,14 +160,15 @@ namespace Foundatio.Repositories.Elasticsearch.Configuration {
             if (!utcEnd.HasValue || utcEnd.Value < utcStart)
                 utcEnd = SystemClock.UtcNow;
 
-            var period = utcEnd.Value - utcStart.Value;
-            if ((MaxIndexAge.HasValue && period > MaxIndexAge.Value) || period.GetTotalYears() > 1)
+            var utcStartOfDay = utcStart.Value.StartOfDay();
+            var utcEndOfDay = utcEnd.Value.EndOfDay();
+            var period = utcEndOfDay - utcStartOfDay;
+            if ((MaxIndexAge.HasValue && period > MaxIndexAge.Value) || period.GetTotalMonths() >= 3)
                 return new string[0];
 
-            var utcEndOfDay = utcEnd.Value.EndOfDay();
-
+            // TODO: Look up aliases that fit these ranges.
             var indices = new List<string>();
-            for (DateTime current = utcStart.Value.StartOfDay(); current <= utcEndOfDay; current = current.AddDays(1))
+            for (var current = utcStartOfDay; current <= utcEndOfDay; current = current.AddDays(1))
                 indices.Add(GetIndex(current));
 
             return indices.ToArray();
@@ -180,7 +187,7 @@ namespace Foundatio.Repositories.Elasticsearch.Configuration {
             if (indexes.Count == 0)
                 return;
 
-            var reindexer = new ElasticReindexer(Configuration.Client, Configuration.Cache, _logger);
+            var reindexer = new ElasticReindexer(Configuration.Client, _logger);
             foreach (var index in indexes) {
                 if (SystemClock.UtcNow > GetIndexExpirationDate(index.DateUtc))
                     continue;
@@ -191,16 +198,14 @@ namespace Foundatio.Repositories.Elasticsearch.Configuration {
                 var reindexWorkItem = new ReindexWorkItem {
                     OldIndex = index.Index,
                     NewIndex = GetVersionedIndex(GetIndexDate(index.Index), Version),
-                    Alias = Name
+                    Alias = Name,
+                    TimestampField = GetTimeStampField()
                 };
 
                 reindexWorkItem.DeleteOld = DiscardIndexesOnReindex && reindexWorkItem.OldIndex != reindexWorkItem.NewIndex;
 
-                foreach (var type in IndexTypes.OfType<IChildIndexType>())
-                    reindexWorkItem.ParentMaps.Add(new ParentMap { Type = type.Name, ParentPath = type.ParentPath });
-
                 // attempt to create the index. If it exists the index will not be created.
-                await CreateIndexAsync(reindexWorkItem.NewIndex, ConfigureDescriptor).AnyContext();
+                await CreateIndexAsync(reindexWorkItem.NewIndex, ConfigureIndex).AnyContext();
 
                 // TODO: progress callback will report 0-100% multiple times...
                 await reindexer.ReindexAsync(reindexWorkItem, progressCallbackAsync).AnyContext();
@@ -222,7 +227,7 @@ namespace Foundatio.Repositories.Elasticsearch.Configuration {
             if (indexes.Count == 0)
                 return;
 
-            var aliasDescriptor = new AliasDescriptor();
+            var aliasDescriptor = new BulkAliasDescriptor();
             foreach (var indexGroup in indexes.OrderBy(i => i.Version).GroupBy(i => i.DateUtc)) {
                 var indexExpirationDate = GetIndexExpirationDate(indexGroup.Key);
 
@@ -233,7 +238,7 @@ namespace Foundatio.Repositories.Elasticsearch.Configuration {
                         try {
                             await CreateAliasAsync(oldestIndex.Index, GetIndex(indexGroup.Key)).AnyContext();
                         } catch (Exception ex) {
-                            _logger.Error(ex, $"Error setting current index version. Will use oldest index version: {oldestIndex.Version}");
+                            _logger.LogError(ex, "Error setting current index version. Will use oldest index version: {OldestIndexVersion}", oldestIndex.Version);
                         }
 
                         foreach (var indexInfo in indexGroup)
@@ -259,15 +264,16 @@ namespace Foundatio.Repositories.Elasticsearch.Configuration {
             }
 
             var response = await Configuration.Client.AliasAsync(aliasDescriptor).AnyContext();
-            _logger.Trace(() => response.GetRequest());
+            if (_logger.IsEnabled(Microsoft.Extensions.Logging.LogLevel.Trace))
+                _logger.LogTrace(response.GetRequest());
 
             if (!response.IsValid) {
-                if (response.ConnectionStatus.HttpStatusCode.GetValueOrDefault() == 404)
+                if (response.ApiCall.HttpStatusCode.GetValueOrDefault() == 404)
                     return;
 
                 string message = $"Error updating aliases: {response.GetErrorMessage()}";
-                _logger.Error().Exception(response.ConnectionStatus.OriginalException).Message(message).Property("request", response.GetRequest()).Write();
-                throw new ApplicationException(message, response.ConnectionStatus.OriginalException);
+                _logger.LogError(response.OriginalException, "Error updating aliases: {0}", message);
+                throw new ApplicationException(message, response.OriginalException);
             }
         }
 
@@ -280,26 +286,26 @@ namespace Foundatio.Repositories.Elasticsearch.Configuration {
                 sw.Restart();
                 try {
                     await DeleteIndexAsync(index.Index).AnyContext();
-                    _logger.Info($"Deleted index {index.Index} of age {SystemClock.UtcNow.Subtract(index.DateUtc).ToWords(true)} in {sw.Elapsed.ToWords(true)}");
+                    _logger.LogInformation("Deleted index {Index} of age {Age:g} in {Duration:g}", index.Index, SystemClock.UtcNow.Subtract(index.DateUtc), sw.Elapsed);
                 } catch (Exception) {}
 
                 sw.Stop();
             }
         }
-        
+
         protected override async Task<IList<IndexInfo>> GetIndexesAsync(int version = -1) {
             var indexes = await base.GetIndexesAsync(version).AnyContext();
             if (indexes.Count == 0)
                 return indexes;
-            
+
             // TODO: Optimize with cat aliases.
             // TODO: Should this return indexes that fall outside of the max age?
             foreach (var indexGroup in indexes.GroupBy(i => GetIndex(i.DateUtc))) {
-                var v = await GetVersionFromAliasAsync(indexGroup.Key).AnyContext();
+                int v = await GetVersionFromAliasAsync(indexGroup.Key).AnyContext();
                 foreach (var indexInfo in indexGroup)
                     indexInfo.CurrentVersion = v;
             }
-            
+
             return indexes;
         }
 

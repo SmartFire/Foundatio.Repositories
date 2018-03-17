@@ -1,15 +1,17 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading.Tasks;
-using Foundatio.Repositories.Elasticsearch.Queries;
+using Foundatio.Repositories.Extensions;
 using Foundatio.Repositories.Models;
+using Foundatio.Repositories.Options;
 using Foundatio.Repositories.Utility;
 
 namespace Foundatio.Repositories.Elasticsearch.Configuration {
     public interface ITimeSeriesIndexType : IIndexType {
-        string GetIndexById(string id);
+        string GetIndexById(Id id);
 
-        string[] GetIndexesByQuery(object query);
+        string[] GetIndexesByQuery(IRepositoryQuery query);
     }
 
     public interface ITimeSeriesIndexType<T> : IIndexType<T>, ITimeSeriesIndexType where T : class {
@@ -43,9 +45,8 @@ namespace Foundatio.Repositories.Elasticsearch.Configuration {
 
                 if (HasIdentity) {
                     // This is also called when trying to create the document id.
-                    var id = ((IIdentity)document).Id;
-                    ObjectId objectId;
-                    if (id != null && ObjectId.TryParse(id, out objectId) && objectId.CreationTime != DateTime.MinValue)
+                    string id = ((IIdentity)document).Id;
+                    if (id != null && ObjectId.TryParse(id, out var objectId) && objectId.CreationTime != DateTime.MinValue)
                         return objectId.CreationTime;
                 }
 
@@ -58,7 +59,7 @@ namespace Foundatio.Repositories.Elasticsearch.Configuration {
                 throw new ArgumentNullException(nameof(document));
 
             if (HasIdentity) {
-                var id = ((IIdentity)document).Id;
+                string id = ((IIdentity)document).Id;
                 if (!String.IsNullOrEmpty(id))
                     return id;
             }
@@ -82,7 +83,7 @@ namespace Foundatio.Repositories.Elasticsearch.Configuration {
             var date = _getDocumentDateUtc(document);
             return TimeSeriesIndex.GetIndex(date);
         }
-        
+
         public virtual Task EnsureIndexAsync(T document) {
             if (document == null)
                 throw new ArgumentNullException(nameof(document));
@@ -94,30 +95,34 @@ namespace Foundatio.Repositories.Elasticsearch.Configuration {
             return TimeSeriesIndex.EnsureIndexAsync(date);
         }
 
-        public virtual string GetIndexById(string id) {
-            if (String.IsNullOrEmpty(id))
+        public virtual string GetIndexById(Id id) {
+            if (String.IsNullOrEmpty(id.Value))
                 throw new ArgumentNullException(nameof(id));
 
-            ObjectId objectId;
-            if (!ObjectId.TryParse(id, out objectId))
+            if (!ObjectId.TryParse(id.Value, out var objectId))
                 throw new ArgumentException("Unable to parse ObjectId", nameof(id));
 
             return TimeSeriesIndex.GetIndex(objectId.CreationTime);
         }
 
-        public virtual string[] GetIndexesByQuery(object query) {
-            var withIndexesQuery = query as IElasticIndexesQuery;
-            if (withIndexesQuery == null)
-                return _defaultIndexes;
-
-            var indexes = new List<string>();
-            if (withIndexesQuery.Indexes.Count > 0)
-                indexes.AddRange(withIndexesQuery.Indexes);
-
-            if (withIndexesQuery.UtcStartIndex.HasValue || withIndexesQuery.UtcEndIndex.HasValue)
-                indexes.AddRange(TimeSeriesIndex.GetIndexes(withIndexesQuery.UtcStartIndex, withIndexesQuery.UtcEndIndex));
-
+        public virtual string[] GetIndexesByQuery(IRepositoryQuery query) {
+            var indexes = GetIndexes(query);
             return indexes.Count > 0 ? indexes.ToArray() : _defaultIndexes;
+        }
+
+        private HashSet<string> GetIndexes(IRepositoryQuery query) {
+            var indexes = new HashSet<string>();
+
+            var elasticIndexes = query.GetElasticIndexes();
+            if (elasticIndexes.Count > 0)
+                indexes.AddRange(elasticIndexes);
+
+            var utcStart = query.GetElasticIndexesStartUtc();
+            var utcEnd = query.GetElasticIndexesEndUtc();
+            if (utcStart.HasValue || utcEnd.HasValue)
+                indexes.AddRange(TimeSeriesIndex.GetIndexes(utcStart, utcEnd));
+
+            return indexes;
         }
 
         protected ITimeSeriesIndex TimeSeriesIndex => (ITimeSeriesIndex)Index;

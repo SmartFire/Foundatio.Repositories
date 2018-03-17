@@ -1,10 +1,9 @@
 ﻿using System;
 using System.Collections.Generic;
-using Foundatio.Repositories.Elasticsearch.Repositories.Queries.Builders;
+using System.Threading.Tasks;
 using Foundatio.Parsers.ElasticQueries;
 using Foundatio.Parsers.LuceneQueries.Visitors;
-using Foundatio.Repositories.Elasticsearch.Configuration;
-using Nest;
+using Foundatio.Repositories.Extensions;
 
 namespace Foundatio.Repositories.Elasticsearch.Queries.Builders {
     public class ElasticQueryBuilder : IElasticQueryBuilder {
@@ -44,42 +43,37 @@ namespace Foundatio.Repositories.Elasticsearch.Queries.Builders {
             return true;
         }
 
-        public void UseQueryParser(Action<ElasticQueryParserConfiguration> configure) {
-            Unregister<SearchQueryBuilder>();
-            Register(new ParsedSearchQueryBuilder(new ElasticQueryParser(configure)));
-        }
+        public void UseQueryParser(ElasticQueryParser parser) {
+            Unregister<ExpressionQueryBuilder>();
+            Register(new ParsedExpressionQueryBuilder(parser));
 
-        public void UseQueryParser<T>(IndexTypeBase<T> indexType) where T : class {
-            UseQueryParser(c => c
-                .UseMappings<T>(indexType.BuildMapping,
-                () => indexType.Configuration.Client.GetMapping(new GetMappingRequest(indexType.Index.Name, indexType.Name)).Mapping)
-                .UseNested());
+            Unregister<AggregationsQueryBuilder>();
+            Register(new AggregationsQueryBuilder());
         }
 
         public void UseAliases(AliasMap aliasMap) {
-            Unregister<SearchQueryBuilder>();
-            Register(new AliasedSearchQueryBuilder(aliasMap));
+            Unregister<ExpressionQueryBuilder>();
+            Register(new AliasedExpressionQueryBuilder(aliasMap));
         }
 
         public void RegisterDefaults() {
             Register<PagableQueryBuilder>();
-            Register<SelectedFieldsQueryBuilder>();
-            Register<SortableQueryBuilder>();
-            Register<AggregationsQueryBuilder>();
+            Register<FieldIncludesQueryBuilder>();
+            Register<SortQueryBuilder>();
+            Register(new AggregationsQueryBuilder());
             Register(new ParentQueryBuilder(this));
             Register(new ChildQueryBuilder(this));
             Register<IdentityQueryBuilder>();
             Register<SoftDeletesQueryBuilder>();
             Register<DateRangeQueryBuilder>();
-            Register(new SearchQueryBuilder());
-            Register(new SystemFilterQueryBuilder(this));
+            Register(new ExpressionQueryBuilder());
             Register<ElasticFilterQueryBuilder>();
             Register<FieldConditionsQueryBuilder>();
         }
 
-        public void Build<T>(QueryBuilderContext<T> ctx) where T : class, new() {
+        public async Task BuildAsync<T>(QueryBuilderContext<T> ctx) where T : class, new() {
             foreach (var builder in _partBuilders)
-                builder.Build(ctx);
+                await builder.BuildAsync(ctx).AnyContext();
         }
 
         private static readonly Lazy<ElasticQueryBuilder> _default = new Lazy<ElasticQueryBuilder>(() => new ElasticQueryBuilder());

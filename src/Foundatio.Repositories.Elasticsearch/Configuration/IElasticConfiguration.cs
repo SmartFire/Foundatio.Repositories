@@ -2,17 +2,19 @@
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
-using Elasticsearch.Net.ConnectionPool;
 using Foundatio.Caching;
 using Foundatio.Jobs;
 using Foundatio.Lock;
-using Foundatio.Logging;
 using Foundatio.Messaging;
 using Foundatio.Queues;
 using Foundatio.Repositories.Extensions;
 using Nest;
 using System.Threading;
+using Elasticsearch.Net;
 using Foundatio.Repositories.Elasticsearch.Queries.Builders;
+using Foundatio.Parsers.ElasticQueries;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Foundatio.Repositories.Elasticsearch.Configuration {
     public interface IElasticConfiguration : IDisposable {
@@ -25,6 +27,7 @@ namespace Foundatio.Repositories.Elasticsearch.Configuration {
         IIndexType GetIndexType(Type type);
         IIndex GetIndex(string name);
         void ConfigureGlobalQueryBuilders(ElasticQueryBuilder builder);
+        void ConfigureGlobalQueryParsers(ElasticQueryParserConfiguration config);
         Task ConfigureIndexesAsync(IEnumerable<IIndex> indexes = null, bool beginReindexingOutdated = true);
         Task MaintainIndexesAsync(IEnumerable<IIndex> indexes = null);
         Task DeleteIndexesAsync(IEnumerable<IIndex> indexes = null);
@@ -34,6 +37,7 @@ namespace Foundatio.Repositories.Elasticsearch.Configuration {
     public class ElasticConfiguration: IElasticConfiguration {
         protected readonly IQueue<WorkItemData> _workItemQueue;
         protected readonly ILogger _logger;
+        protected readonly ILockProvider _beginReindexLockProvider;
         protected readonly ILockProvider _lockProvider;
         private readonly List<IIndex> _indexes = new List<IIndex>();
         private readonly Lazy<IReadOnlyCollection<IIndex>> _frozenIndexes;
@@ -42,12 +46,13 @@ namespace Foundatio.Repositories.Elasticsearch.Configuration {
 
         public ElasticConfiguration(IQueue<WorkItemData> workItemQueue = null, ICacheClient cacheClient = null, IMessageBus messageBus = null, ILoggerFactory loggerFactory = null) {
             _workItemQueue = workItemQueue;
-            _logger = loggerFactory.CreateLogger(GetType());
-            LoggerFactory = loggerFactory;
-            Cache = cacheClient ?? new InMemoryCacheClient(loggerFactory);
-            _lockProvider = new ThrottlingLockProvider(Cache, 1, TimeSpan.FromMinutes(5));
+            LoggerFactory = loggerFactory ?? NullLoggerFactory.Instance;
+            _logger = LoggerFactory.CreateLogger(GetType());
+            Cache = cacheClient ?? new InMemoryCacheClient(new InMemoryCacheClientOptions { LoggerFactory = loggerFactory });
+            _lockProvider = new CacheLockProvider(Cache, messageBus, loggerFactory);
+            _beginReindexLockProvider = new ThrottlingLockProvider(Cache, 1, TimeSpan.FromMinutes(15));
             _shouldDisposeCache = cacheClient == null;
-            MessageBus = messageBus ?? new InMemoryMessageBus(loggerFactory);
+            MessageBus = messageBus ?? new InMemoryMessageBus(new InMemoryMessageBusOptions { LoggerFactory = loggerFactory });
             _frozenIndexes = new Lazy<IReadOnlyCollection<IIndex>>(() => _indexes.AsReadOnly());
             _client = new Lazy<IElasticClient>(CreateElasticClient);
         }
@@ -63,8 +68,10 @@ namespace Foundatio.Repositories.Elasticsearch.Configuration {
 
         public virtual void ConfigureGlobalQueryBuilders(ElasticQueryBuilder builder) {}
 
+        public virtual void ConfigureGlobalQueryParsers(ElasticQueryParserConfiguration config) {}
+
         protected virtual void ConfigureSettings(ConnectionSettings settings) {
-            settings.EnableTcpKeepAlive(30 * 1000, 2000);
+            settings.EnableTcpKeepAlive(TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(2));
         }
 
         protected virtual IConnectionPool CreateConnectionPool() {
@@ -111,18 +118,16 @@ namespace Foundatio.Repositories.Elasticsearch.Configuration {
 
             foreach (var idx in indexes) {
                 await idx.ConfigureAsync().AnyContext();
-                var maintainableIndex = idx as IMaintainableIndex;
-                if (maintainableIndex != null)
+                if (idx is IMaintainableIndex maintainableIndex)
                     await maintainableIndex.MaintainAsync(includeOptionalTasks: false).AnyContext();
 
                 if (!beginReindexingOutdated)
                     continue;
 
-                if (_workItemQueue == null || _lockProvider == null)
+                if (_workItemQueue == null || _beginReindexLockProvider == null)
                     throw new InvalidOperationException("Must specify work item queue and lock provider in order to reindex.");
 
-                var versionedIndex = idx as VersionedIndex;
-                if (versionedIndex == null)
+                if (!(idx is VersionedIndex versionedIndex))
                     continue;
 
                 int currentVersion = await versionedIndex.GetCurrentVersionAsync().AnyContext();
@@ -130,13 +135,13 @@ namespace Foundatio.Repositories.Elasticsearch.Configuration {
                     continue;
 
                 var reindexWorkItem = versionedIndex.CreateReindexWorkItem(currentVersion);
-                bool isReindexing = await _lockProvider.IsLockedAsync(String.Concat("reindex:", reindexWorkItem.Alias, reindexWorkItem.OldIndex, reindexWorkItem.NewIndex)).AnyContext();
-                // already reindexing
+                bool isReindexing = await _lockProvider.IsLockedAsync(String.Join(":", "reindex", reindexWorkItem.Alias, reindexWorkItem.OldIndex, reindexWorkItem.NewIndex)).AnyContext();
                 if (isReindexing)
                     continue;
 
-                // enqueue reindex to new version
-                await _lockProvider.TryUsingAsync("enqueue-reindex", () => _workItemQueue.EnqueueAsync(reindexWorkItem), TimeSpan.Zero, CancellationToken.None).AnyContext();
+                // enqueue reindex to new version, only allowed every 15 minutes
+                string enqueueReindexLockName = String.Join(":", "enqueue-reindex", reindexWorkItem.Alias, reindexWorkItem.OldIndex, reindexWorkItem.NewIndex);
+                await _beginReindexLockProvider.TryUsingAsync(enqueueReindexLockName, () => _workItemQueue.EnqueueAsync(reindexWorkItem), TimeSpan.Zero, new CancellationToken(true)).AnyContext();
             }
         }
 
@@ -148,12 +153,15 @@ namespace Foundatio.Repositories.Elasticsearch.Configuration {
                 await idx.MaintainAsync().AnyContext();
         }
 
-        public async Task DeleteIndexesAsync(IEnumerable<IIndex> indexes = null) {
+        public Task DeleteIndexesAsync(IEnumerable<IIndex> indexes = null) {
             if (indexes == null)
                 indexes = Indexes;
 
+            var tasks = new List<Task>();
             foreach (var idx in indexes)
-                await idx.DeleteAsync().AnyContext();
+                tasks.Add(idx.DeleteAsync());
+
+            return Task.WhenAll(tasks);
         }
 
         public async Task ReindexAsync(IEnumerable<IIndex> indexes = null, Func<int, string, Task> progressCallbackAsync = null) {

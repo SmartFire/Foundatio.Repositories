@@ -1,19 +1,20 @@
-﻿using System;
+﻿using System.Linq;
+using System.Threading.Tasks;
 using Foundatio.Repositories.Queries;
 using Nest;
 
 namespace Foundatio.Repositories.Elasticsearch.Queries.Builders {
     public class IdentityQueryBuilder : IElasticQueryBuilder {
-        public void Build<T>(QueryBuilderContext<T> ctx) where T : class, new() {
-            var identityQuery = ctx.GetSourceAs<IIdentityQuery>();
-            if (identityQuery == null)
-                return; 
+        public Task BuildAsync<T>(QueryBuilderContext<T> ctx) where T : class, new() {
+            var ids = ctx.Source.GetIds();
+            if (ids.Count > 0)
+                ctx.Filter &= new IdsQuery { Values = ids.Select(id => new Nest.Id(id)) };
 
-            if (identityQuery.Ids != null && identityQuery.Ids.Count > 0)
-                ctx.Filter &= new IdsFilter { Values = identityQuery.Ids };
+            var excludesIds = ctx.Source.GetExcludedIds();
+            if (excludesIds.Count > 0)
+                ctx.Filter &= !new IdsQuery { Values = excludesIds.Select(id => new Nest.Id(id)) };
 
-            if (identityQuery.ExcludedIds != null && identityQuery.ExcludedIds.Count > 0)
-                ctx.Filter &= !new IdsFilter { Values = identityQuery.ExcludedIds }.ToContainer();
+            return Task.CompletedTask;
         }
     }
 }
