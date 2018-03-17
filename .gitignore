@@ -6,6 +6,9 @@
 *.user
 *.sln.docstates
 
+# project.json
+*.lock.json
+.vs
 # Build results
 [Dd]ebug/
 [Dd]ebugPublic/
@@ -16,6 +19,8 @@ x86/
 bld/
 [Bb]in/
 [Oo]bj/
+build/kibana-*
+build/elasticsearch-*
 
 # Roslyn cache directories
 *.ide/
@@ -180,4 +185,9 @@ UpgradeLog*.htm
 
 # Microsoft Fakes
 FakesAssemblies/
+
 .vs/config/applicationhost.config
+*.nugetreferenceswitcher
+/build/kibana-*
+/build/elastic-*
+
